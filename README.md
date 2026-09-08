@@ -1,4 +1,4 @@
-# HCR / SpeiGo VPN Manager PRO v1.4.0 MULTI-PORT (amd64)
+# HCR / SpeiGo VPN Manager PRO v1.4.1 MULTI-PORT HEALTH FIX (amd64)
 
 Manager profesional para el binario oficial **hcr-server 0.0.3 - Patch 1**.
 
@@ -97,3 +97,13 @@ bash <(curl -Ls https://raw.githubusercontent.com/apksdemons/apks_hcr/refs/heads
 ```
 
 El launcher actualiza `install.sh`, `hcr-server` y `README.md` en `/opt/speigo-hcr` y abre el menú.
+
+
+## Corrección v1.4.1
+
+- Corrige el falso `[OK]` que podía aparecer después de fallar la comprobación de un puerto adicional.
+- Un listener extra solo queda registrado cuando `systemd` está `active`, mantiene el mismo PID y el puerto TCP está realmente en `LISTEN` durante 3 comprobaciones consecutivas.
+- Si no se estabiliza, muestra diagnóstico real (`systemctl status` + journal), elimina la unidad fallida y no deja un puerto fantasma en el manager.
+- La espera de salud tolera el tiempo normal de arranque de systemd, evitando falsos negativos por revisar el PID demasiado pronto.
+- Se silencian warnings de `systemd-analyze` originados por servicios ajenos instalados en la VPS, como BADVPN; no se confunden con errores HCR.
+- El motor oficial `hcr-server` y el perfil de rendimiento permanecen sin cambios.

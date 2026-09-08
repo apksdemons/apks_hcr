@@ -6,7 +6,7 @@ LC_ALL="C"
 LANG="C"
 export PATH LC_ALL LANG
 
-MANAGER_VERSION="1.4.0"
+MANAGER_VERSION="1.4.1"
 SERVICE_NAME="hcr-server"
 SYSTEMD_DIR="/etc/systemd/system"
 DEFAULT_PORT="8880"
@@ -263,11 +263,19 @@ extra_service_is_active() {
 port_has_listener() {
   local p="$1"
   if command -v ss >/dev/null 2>&1; then
-    ss -ltnH "sport = :${p}" 2>/dev/null | grep -q .
+    # No usar el filtro `sport = :PORT`: algunas versiones antiguas de ss lo
+    # interpretan distinto. Parsear la lista completa es más portable.
+    ss -ltnH 2>/dev/null | awk -v p="$p" '
+      $4 ~ (":" p "$") { found=1; exit }
+      END { exit(found ? 0 : 1) }
+    '
     return $?
   fi
   if command -v netstat >/dev/null 2>&1; then
-    netstat -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${p}$"
+    netstat -ltn 2>/dev/null | awk -v p="$p" '
+      NR > 2 && $4 ~ (":" p "$") { found=1; exit }
+      END { exit(found ? 0 : 1) }
+    '
     return $?
   fi
   return 1
@@ -290,8 +298,8 @@ render_extra_unit() {
   if [ "$t" = "tls" ] || [ "$t" = "auto" ]; then
     tls_args=" --tls-cert ${TLS_CERT_PATH} --tls-key ${TLS_KEY_PATH}"
   fi
-  TEMP_UNIT="$(mktemp "${SCRIPT_DIR}/.hcr-extra-${p}.XXXXXX.service")"
-  chmod 0600 "$TEMP_UNIT"
+  TEMP_UNIT="$(mktemp "${SCRIPT_DIR}/.hcr-extra-${p}.XXXXXX.service")" || { fail "No se pudo crear la unidad temporal para TCP $p."; return 1; }
+  chmod 0600 "$TEMP_UNIT" || { fail "No se pudieron aplicar permisos a la unidad temporal TCP $p."; return 1; }
   cat > "$TEMP_UNIT" <<EOF
 [Unit]
 Description=SpeiGo HCR relay extra TCP ${p}
@@ -335,48 +343,112 @@ SyslogIdentifier=hcr-server-extra-${p}
 [Install]
 WantedBy=multi-user.target
 EOF
-  chmod 0644 "$TEMP_UNIT"
-  systemd-analyze verify "$TEMP_UNIT"
-  mv -f -- "$TEMP_UNIT" "$src"
+  chmod 0644 "$TEMP_UNIT" || { fail "No se pudieron aplicar permisos a la unidad TCP $p."; return 1; }
+  # systemd-analyze puede imprimir warnings de unidades AJENAS ya instaladas
+  # (como BADVPN). systemctl + listener TCP son la validación real de este HCR.
+  systemd-analyze verify "$TEMP_UNIT" >/dev/null 2>&1 || true
+  mv -f -- "$TEMP_UNIT" "$src" || { fail "No se pudo instalar la unidad systemd extra TCP $p."; return 1; }
   TEMP_UNIT=""
 }
 
-verify_extra_health() {
-  local p="$1" svc pid
+show_extra_failure_diagnostics() {
+  local p="$1" svc
   svc="$(extra_service_name "$p").service"
-  pid="$(systemctl show --property=MainPID --value "$svc" 2>/dev/null || true)"
-  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || fail "El listener HCR extra TCP $p no reportó un PID válido."
-  sleep 2
-  systemctl is-active --quiet "$svc" || fail "El listener HCR extra TCP $p no permaneció activo."
-  [ "$(systemctl show --property=MainPID --value "$svc")" = "$pid" ] || fail "El listener HCR extra TCP $p se reinició durante la comprobación."
+  printf '%b[DIAGNÓSTICO]%b Estado de %s:\n' "$C_GOLD" "$C_RESET" "$svc" >&2
+  systemctl status --no-pager --full "$svc" 2>/dev/null | sed -n '1,18p' >&2 || true
+  printf '%b[DIAGNÓSTICO]%b Últimas líneas del journal:\n' "$C_GOLD" "$C_RESET" >&2
+  journalctl -u "$svc" -n 18 --no-pager 2>/dev/null >&2 || true
+}
+
+verify_extra_health() {
+  local p="$1" svc pid="" last_pid="" stable=0 i
+  svc="$(extra_service_name "$p").service"
+
+  # Espera de asentamiento: el listener debe estar active, tener PID válido y
+  # escuchar realmente en TCP p durante 3 comprobaciones consecutivas con el
+  # mismo PID. Esto evita tanto falsos OK como falsos errores por arranque.
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+      pid="$(systemctl show --property=MainPID --value "$svc" 2>/dev/null || true)"
+      if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && port_has_listener "$p"; then
+        if [ "$pid" = "$last_pid" ]; then
+          stable=$((stable + 1))
+        else
+          last_pid="$pid"
+          stable=1
+        fi
+        [ "$stable" -ge 3 ] && return 0
+      else
+        stable=0
+        last_pid=""
+      fi
+    else
+      stable=0
+      last_pid=""
+    fi
+    sleep 1
+  done
+
+  fail "El listener HCR extra TCP $p no logró permanecer activo y escuchando de forma estable."
+  show_extra_failure_diagnostics "$p"
+  return 1
+}
+
+cleanup_failed_extra_install() {
+  local p="$1" svc src link
+  svc="$(extra_service_name "$p")"
+  src="$(extra_unit_source_path "$p")"
+  link="$(extra_unit_link_path "$p")"
+  systemctl disable --now "${svc}.service" >/dev/null 2>&1 || true
+  if [ -L "$link" ] && [ "$(readlink -- "$link" 2>/dev/null || true)" = "$src" ]; then
+    rm -f -- "$link"
+  fi
+  rm -f -- "$src"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl reset-failed "${svc}.service" >/dev/null 2>&1 || true
 }
 
 install_extra_service() {
   local p="$1" t="$2" f="$3" d="$4" svc src link
-  validate_port "$p" || fail "Puerto extra inválido: $p"
-  validate_transport "$t" || fail "Transport extra inválido: $t"
-  validate_frame "$f" || fail "Frame extra inválido: $f"
-  validate_timeout "$d" || fail "Poll extra inválido: $d"
-  validate_secure_directory
-  validate_root_file true "Manager" "$SCRIPT_PATH"
-  validate_root_file true "Binario HCR" "$BINARY_PATH"
-  validate_binary_identity
-  if [ "$t" = "tls" ] || [ "$t" = "auto" ]; then validate_tls_pair; fi
-  validate_extra_unit_link "$p"
+  validate_port "$p" || { fail "Puerto extra inválido: $p"; return 1; }
+  validate_transport "$t" || { fail "Transport extra inválido: $t"; return 1; }
+  validate_frame "$f" || { fail "Frame extra inválido: $f"; return 1; }
+  validate_timeout "$d" || { fail "Poll extra inválido: $d"; return 1; }
+  validate_secure_directory || return 1
+  validate_root_file true "Manager" "$SCRIPT_PATH" || return 1
+  validate_root_file true "Binario HCR" "$BINARY_PATH" || return 1
+  validate_binary_identity || return 1
+  if [ "$t" = "tls" ] || [ "$t" = "auto" ]; then validate_tls_pair || return 1; fi
+  validate_extra_unit_link "$p" || return 1
+
   svc="$(extra_service_name "$p")"
   src="$(extra_unit_source_path "$p")"
   link="$(extra_unit_link_path "$p")"
-  render_extra_unit "$p" "$t" "$f" "$d"
-  [ -L "$link" ] || ln -s -- "$src" "$link"
-  systemctl daemon-reload
-  systemctl enable "${svc}.service" >/dev/null
-  systemctl reset-failed "${svc}.service" >/dev/null 2>&1 || true
-  if ! systemctl restart "${svc}.service"; then
-    systemctl status --no-pager --full "${svc}.service" || true
-    fail "El listener HCR extra TCP $p no pudo iniciar."
+
+  render_extra_unit "$p" "$t" "$f" "$d" || return 1
+  if [ ! -L "$link" ]; then
+    ln -s -- "$src" "$link" || { fail "No se pudo enlazar la unidad extra TCP $p."; cleanup_failed_extra_install "$p"; return 1; }
   fi
-  verify_extra_health "$p"
-  extra_state_add "$p" "$t" "$f" "$d"
+  systemctl daemon-reload || { fail "systemd no pudo recargar unidades para TCP $p."; cleanup_failed_extra_install "$p"; return 1; }
+  systemctl enable "${svc}.service" >/dev/null || { fail "No se pudo habilitar ${svc}.service."; cleanup_failed_extra_install "$p"; return 1; }
+  systemctl reset-failed "${svc}.service" >/dev/null 2>&1 || true
+
+  if ! systemctl restart "${svc}.service"; then
+    fail "El listener HCR extra TCP $p no pudo iniciar."
+    show_extra_failure_diagnostics "$p"
+    cleanup_failed_extra_install "$p"
+    return 1
+  fi
+  if ! verify_extra_health "$p"; then
+    cleanup_failed_extra_install "$p"
+    return 1
+  fi
+  if ! extra_state_add "$p" "$t" "$f" "$d"; then
+    fail "El listener TCP $p inició, pero no se pudo guardar su estado."
+    cleanup_failed_extra_install "$p"
+    return 1
+  fi
+  return 0
 }
 
 remove_extra_service() {
@@ -421,7 +493,17 @@ add_extra_port_menu() {
   validate_port "$p" || { fail "Puerto inválido."; return 1; }
   p="$((10#$p))"
   [ "$p" != "$main_port" ] || { fail "TCP $p ya es el puerto HCR principal."; return 1; }
-  ! extra_port_exists "$p" || { fail "TCP $p ya está registrado como puerto HCR adicional."; return 1; }
+  if extra_port_exists "$p"; then
+    if extra_service_is_active "$p" && port_has_listener "$p"; then
+      fail "TCP $p ya está registrado y funcionando como puerto HCR adicional."
+      return 1
+    fi
+    # Recuperación específica para registros fantasma creados por v1.4.0:
+    # si estaba registrado pero no existe un listener sano, limpiar y recrear.
+    printf '%b[REPARANDO]%b Registro HCR extra TCP %s incompleto/antiguo; se recreará.\n' "$C_GOLD" "$C_RESET" "$p"
+    cleanup_failed_extra_install "$p"
+    extra_state_remove "$p"
+  fi
   if port_has_listener "$p"; then
     fail "TCP $p ya está ocupado por otro listener. Elige otro puerto."
     return 1
@@ -436,11 +518,16 @@ add_extra_port_menu() {
       ;;
     *) : ;;
   esac
-  install_extra_service "$p" "$et" "$ef" "$ed"
+
+  if ! install_extra_service "$p" "$et" "$ef" "$ed"; then
+    load_state
+    printf '%b[NO CREADO]%b TCP %s no se registró como listener HCR adicional.\n' "$C_RED" "$C_RESET" "$p"
+    return 1
+  fi
+
   firewall_open "$p" || true
-  # Restaurar visualmente el estado del principal después de usar selectores globales.
   load_state
-  printf '%b[OK]%b Listener HCR adicional TCP %s creado y funcionando.\n' "$C_GREEN" "$C_RESET" "$p"
+  printf '%b[OK]%b Listener HCR adicional TCP %s creado, estable y escuchando.\n' "$C_GREEN" "$C_RESET" "$p"
 }
 
 remove_extra_port_menu() {
@@ -522,42 +609,60 @@ SyslogIdentifier=hcr-server
 WantedBy=multi-user.target
 EOF
   chmod 0644 "$TEMP_UNIT"
-  systemd-analyze verify "$TEMP_UNIT"
+  systemd-analyze verify "$TEMP_UNIT" >/dev/null 2>&1 || true
 }
 
 verify_service_health() {
-  local pid
-  pid="$(systemctl show --property=MainPID --value "${SERVICE_NAME}.service" 2>/dev/null || true)"
-  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || fail "El servicio no reportó un PID válido."
-  sleep 2
-  systemctl is-active --quiet "${SERVICE_NAME}.service" || fail "HCR no permaneció activo después de iniciar."
-  [ "$(systemctl show --property=MainPID --value "${SERVICE_NAME}.service")" = "$pid" ] || fail "HCR se reinició durante la comprobación inicial."
+  local pid="" last_pid="" stable=0 i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if systemctl is-active --quiet "${SERVICE_NAME}.service" 2>/dev/null; then
+      pid="$(systemctl show --property=MainPID --value "${SERVICE_NAME}.service" 2>/dev/null || true)"
+      if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && port_has_listener "$PORT"; then
+        if [ "$pid" = "$last_pid" ]; then stable=$((stable + 1)); else last_pid="$pid"; stable=1; fi
+        [ "$stable" -ge 3 ] && return 0
+      else
+        stable=0; last_pid=""
+      fi
+    else
+      stable=0; last_pid=""
+    fi
+    sleep 1
+  done
+  fail "HCR principal no logró permanecer activo y escuchando de forma estable en TCP $PORT."
+  systemctl status --no-pager --full "${SERVICE_NAME}.service" 2>/dev/null | sed -n '1,18p' >&2 || true
+  journalctl -u "${SERVICE_NAME}.service" -n 18 --no-pager 2>/dev/null >&2 || true
+  return 1
 }
 
 install_service() {
-  validate_port "$PORT" || fail "Puerto inválido: $PORT"
-  validate_transport "$TRANSPORT" || fail "Transport inválido: $TRANSPORT"
-  validate_frame "$MAX_DOWNLOAD_FRAME" || fail "MAX_DOWNLOAD_FRAME debe estar entre 512 y 16384."
-  validate_timeout "$DOWNLOAD_POLL_TIMEOUT" || fail "DOWNLOAD_POLL_TIMEOUT inválido (ej. 8s)."
+  validate_port "$PORT" || { fail "Puerto inválido: $PORT"; return 1; }
+  validate_transport "$TRANSPORT" || { fail "Transport inválido: $TRANSPORT"; return 1; }
+  validate_frame "$MAX_DOWNLOAD_FRAME" || { fail "MAX_DOWNLOAD_FRAME debe estar entre 512 y 16384."; return 1; }
+  validate_timeout "$DOWNLOAD_POLL_TIMEOUT" || { fail "DOWNLOAD_POLL_TIMEOUT inválido (ej. 8s)."; return 1; }
   PORT="$((10#$PORT))"; MAX_DOWNLOAD_FRAME="$((10#$MAX_DOWNLOAD_FRAME))"
   if extra_port_exists "$PORT"; then
     fail "TCP $PORT ya pertenece a un listener HCR adicional. Elimina ese extra antes de usarlo como puerto principal."
     return 1
   fi
-  validate_bundle
-  validate_unit_link
-  render_unit
-  mv -f -- "$TEMP_UNIT" "$UNIT_SOURCE_PATH"; TEMP_UNIT=""
-  [ -L "$UNIT_LINK_PATH" ] || ln -s -- "$UNIT_SOURCE_PATH" "$UNIT_LINK_PATH"
-  systemctl daemon-reload
-  systemctl enable "${SERVICE_NAME}.service" >/dev/null
+  validate_bundle || return 1
+  validate_unit_link || return 1
+  render_unit || return 1
+  mv -f -- "$TEMP_UNIT" "$UNIT_SOURCE_PATH" || { fail "No se pudo instalar la unidad principal."; return 1; }
+  TEMP_UNIT=""
+  if [ ! -L "$UNIT_LINK_PATH" ]; then
+    ln -s -- "$UNIT_SOURCE_PATH" "$UNIT_LINK_PATH" || { fail "No se pudo enlazar hcr-server.service."; return 1; }
+  fi
+  systemctl daemon-reload || { fail "systemd no pudo recargar hcr-server.service."; return 1; }
+  systemctl enable "${SERVICE_NAME}.service" >/dev/null || { fail "No se pudo habilitar hcr-server.service."; return 1; }
   systemctl reset-failed "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
   if ! systemctl restart "${SERVICE_NAME}.service"; then
     systemctl status --no-pager --full "${SERVICE_NAME}.service" || true
     fail "HCR no pudo iniciar."
+    return 1
   fi
-  verify_service_health
-  save_state
+  verify_service_health || return 1
+  save_state || { fail "HCR inició, pero no se pudo guardar el estado del manager."; return 1; }
+  return 0
 }
 
 service_is_active() { systemctl is-active --quiet "${SERVICE_NAME}.service" 2>/dev/null; }
@@ -683,7 +788,10 @@ show_menu() {
 install_quick() {
   PORT="$DEFAULT_PORT"; TRANSPORT="plain"; MAX_DOWNLOAD_FRAME="$DEFAULT_MAX_DOWNLOAD_FRAME"; DOWNLOAD_POLL_TIMEOUT="$DEFAULT_DOWNLOAD_POLL_TIMEOUT"
   printf '\nInstalando HCR Plain en TCP %s con perfil %s / %s...\n' "$PORT" "$MAX_DOWNLOAD_FRAME" "$DOWNLOAD_POLL_TIMEOUT"
-  install_service
+  if ! install_service; then
+    printf '%b[ERROR]%b La instalación principal no pasó la comprobación de salud.\n' "$C_RED" "$C_RESET"
+    return 1
+  fi
   firewall_open "$PORT" || true
   printf '%b[OK]%b HCR instalado y activo.\n' "$C_GREEN" "$C_RESET"
 }
@@ -724,7 +832,10 @@ custom_install() {
   if [ "$TRANSPORT" = "tls" ] || [ "$TRANSPORT" = "auto" ]; then
     printf 'TLS requiere fullchain.pem y privkey.pem junto al manager.\n'
   fi
-  install_service
+  if ! install_service; then
+    printf '%b[ERROR]%b La instalación personalizada no pasó la comprobación de salud.\n' "$C_RED" "$C_RESET"
+    return 1
+  fi
   firewall_open "$PORT" || true
   printf '%b[OK]%b Instalación personalizada completada.\n' "$C_GREEN" "$C_RESET"
 }
@@ -748,7 +859,12 @@ change_port() {
     PORT="$old"
     return 1
   fi
-  install_service
+  if ! install_service; then
+    PORT="$old"
+    load_state
+    printf '%b[ERROR]%b No se cambió el puerto principal porque el nuevo listener no quedó estable.\n' "$C_RED" "$C_RESET"
+    return 1
+  fi
   firewall_open "$PORT" || true
   printf '%b[OK]%b HCR principal cambió de TCP %s a TCP %s.\n' "$C_GREEN" "$C_RESET" "$old" "$PORT"
   if [ -f "$FIREWALL_STATE_PATH" ] && grep -qx "$old" "$FIREWALL_STATE_PATH" 2>/dev/null; then firewall_close "$old" || true; fi
@@ -760,7 +876,12 @@ change_transport() {
   local old="$TRANSPORT"
   choose_transport || return 1
   [ "$TRANSPORT" = "$old" ] && { echo "El transport ya es $TRANSPORT."; return 0; }
-  install_service
+  if ! install_service; then
+    TRANSPORT="$old"
+    load_state
+    printf '%b[ERROR]%b No se cambió el transport porque el servicio no quedó estable.\n' "$C_RED" "$C_RESET"
+    return 1
+  fi
   printf '%b[OK]%b Transport cambiado: %s -> %s.\n' "$C_GREEN" "$C_RESET" "$old" "$TRANSPORT"
 }
 
@@ -771,7 +892,13 @@ change_performance() {
   choose_frame || return 1
   prompt_read value "DOWNLOAD_POLL_TIMEOUT [actual ${DOWNLOAD_POLL_TIMEOUT}, recomendado 8s]: " || return 1
   [ -n "$value" ] && { validate_timeout "$value" || { fail "Timeout inválido."; return 1; }; DOWNLOAD_POLL_TIMEOUT="$value"; }
-  install_service
+  if ! install_service; then
+    MAX_DOWNLOAD_FRAME="$old_frame"
+    DOWNLOAD_POLL_TIMEOUT="$old_poll"
+    load_state
+    printf '%b[ERROR]%b No se aplicó el perfil porque el servicio no quedó estable.\n' "$C_RED" "$C_RESET"
+    return 1
+  fi
   printf '%b[OK]%b Rendimiento actualizado: Frame %s -> %s | Poll %s -> %s.\n' "$C_GREEN" "$C_RESET" "$old_frame" "$MAX_DOWNLOAD_FRAME" "$old_poll" "$DOWNLOAD_POLL_TIMEOUT"
 }
 
@@ -802,19 +929,26 @@ show_status() {
 
 restart_hcr() {
   service_is_installed || { fail "HCR principal aún no está instalado."; return 1; }
-  systemctl restart "${SERVICE_NAME}.service"
-  verify_service_health
+  load_state
+  if ! systemctl restart "${SERVICE_NAME}.service"; then
+    fail "No se pudo reiniciar HCR principal."
+    return 1
+  fi
+  verify_service_health || return 1
+
   local p t f d
   if [ -f "$EXTRA_STATE_PATH" ]; then
     while read -r p t f d; do
       validate_port "${p:-}" || continue
-      systemctl restart "$(extra_service_name "$p").service"
-      verify_extra_health "$p"
+      if ! systemctl restart "$(extra_service_name "$p").service"; then
+        fail "No se pudo reiniciar HCR extra TCP $p."
+        return 1
+      fi
+      verify_extra_health "$p" || return 1
     done < "$EXTRA_STATE_PATH"
   fi
   printf '%b[OK]%b HCR principal y todos los puertos adicionales fueron reiniciados correctamente.\n' "$C_GREEN" "$C_RESET"
 }
-
 
 show_logs() {
   service_is_installed || { fail "HCR principal aún no está instalado."; return 1; }
