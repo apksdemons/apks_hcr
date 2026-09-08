@@ -6,7 +6,7 @@ LC_ALL="C"
 LANG="C"
 export PATH LC_ALL LANG
 
-MANAGER_VERSION="1.5.0"
+MANAGER_VERSION="1.5.2"
 SERVICE_NAME="hcr-server"
 SYSTEMD_DIR="/etc/systemd/system"
 DEFAULT_PORT="8880"
@@ -29,7 +29,7 @@ else
   C_GOLD=''; C_GREEN=''; C_RED=''; C_CYAN=''; C_WHITE=''; C_GRAY=''; C_RESET=''
 fi
 
-BAR='=x=x=x=x=x=x=x=x=x=x=x=x=x=x=x=x=x=x=x=x='
+BAR='=×=×=×=×=×=×=×=×=×=×=×=×=×=×=×=×=×=×=×=×=×=×=×=×=×=×=×=×=×='
 
 fail() {
   printf '%bError:%b %s\n' "$C_RED" "$C_RESET" "$*" >&2
@@ -991,7 +991,10 @@ show_menu() {
   printf '%b%s%b\n' "$C_GOLD" "$BAR" "$C_RESET"
   printf '%b      HCR / SPEIGO VPN  -  MENÚ DE INSTALACIONES%b\n' "$C_WHITE" "$C_RESET"
   printf '%b              Manager PRO v%s AUTO-TUNE MULTI-PORT%b\n' "$C_GRAY" "$MANAGER_VERSION" "$C_RESET"
-  printf '%b%s%b\n' "$C_GOLD" "$BAR" "$C_RESET"
+
+  # Estado y capacidad siempre arriba, antes de las opciones del menú.
+  status_line
+
   printf '  %b[1]%b Instalación rápida HCR Plain :%s  %b[16384 / 8s]%b\n' "$C_CYAN" "$C_RESET" "$DEFAULT_PORT" "$C_GREEN" "$C_RESET"
   printf '  %b[2]%b Instalación personalizada principal (Plain/TLS/Auto)\n' "$C_CYAN" "$C_RESET"
   printf '  %b[3]%b Cambiar puerto HCR principal\n' "$C_CYAN" "$C_RESET"
@@ -1007,7 +1010,7 @@ show_menu() {
   printf ' %b[13]%b Desinstalar HCR completo\n' "$C_CYAN" "$C_RESET"
   printf ' %b[14]%b Recalcular AUTO-TUNE CPU/RAM\n' "$C_CYAN" "$C_RESET"
   printf '  %b[0]%b Salir\n' "$C_CYAN" "$C_RESET"
-  status_line
+  printf '%b%s%b\n' "$C_GOLD" "$BAR" "$C_RESET"
 }
 
 install_quick() {

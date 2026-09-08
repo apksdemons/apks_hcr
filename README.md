@@ -1,8 +1,12 @@
-# HCR / SpeiGo VPN Manager PRO v1.5.0 AUTO-TUNE MULTI-PORT (amd64)
+# HCR / SpeiGo VPN Manager PRO v1.5.2 STATUS-TOP AUTO-TUNE MULTI-PORT (amd64)
 
 Manager profesional para el binario oficial **hcr-server 0.0.3 - Patch 1**.
 
 Esta versión mantiene el MULTI-PORT y el HEALTH FIX de v1.4.1 y agrega **AUTO-TUNE por CPU/RAM/listeners**.
+
+## Cambio visual v1.5.2
+
+El bloque de estado del HCR ahora aparece **arriba de las opciones del menú**. Se muestran primero el listener principal, los puertos HCR adicionales y el resumen AUTO-TUNE; después aparecen las opciones `[1]..[14]`. Este cambio es únicamente de presentación: no modifica listeners, systemd, AUTO-TUNE, firewall, `MAX_DOWNLOAD_FRAME`, `DOWNLOAD_POLL_TIMEOUT` ni el binario HCR.
 
 ## Abrir el menú
 
@@ -26,7 +30,7 @@ sudo ./install.sh menu
 
 El AUTO-TUNE **no modifica el protocolo HCR ni estos parámetros de transporte**.
 
-## AUTO-TUNE v1.5.0
+## AUTO-TUNE v1.5.2
 
 El manager detecta automáticamente:
 
@@ -163,4 +167,8 @@ Si falla, no muestra un falso `[OK]`, elimina la unidad fallida y enseña `syste
 
 ## Seguridad de la optimización
 
-v1.5.0 no modifica sysctl globales, TCP congestion control, SSH, iptables/nftables ni otros servicios de la VPS. La optimización se mantiene dentro de las unidades HCR administradas para reducir el riesgo de afectar la estabilidad del servidor.
+v1.5.2 no modifica sysctl globales, TCP congestion control, SSH, iptables/nftables ni otros servicios de la VPS. La optimización se mantiene dentro de las unidades HCR administradas para reducir el riesgo de afectar la estabilidad del servidor.
+
+## Estilo visual v1.5.2
+
+Las líneas separadoras del menú usan el patrón `=×=×=×=...` y se muestran en amarillo/oro cuando la terminal soporta ANSI. No cambia la lógica HCR, AUTO-TUNE ni MULTI-PORT.
