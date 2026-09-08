@@ -6,7 +6,7 @@ LC_ALL="C"
 LANG="C"
 export PATH LC_ALL LANG
 
-MANAGER_VERSION="1.4.1"
+MANAGER_VERSION="1.5.0"
 SERVICE_NAME="hcr-server"
 SYSTEMD_DIR="/etc/systemd/system"
 DEFAULT_PORT="8880"
@@ -47,6 +47,7 @@ UNIT_LINK_PATH="${SYSTEMD_DIR}/${SERVICE_NAME}.service"
 STATE_PATH="${SCRIPT_DIR}/hcr-manager.conf"
 FIREWALL_STATE_PATH="${SCRIPT_DIR}/.hcr-manager-firewall"
 EXTRA_STATE_PATH="${SCRIPT_DIR}/hcr-extra-ports.conf"
+AUTOTUNE_STATE_PATH="${SCRIPT_DIR}/hcr-autotune.conf"
 
 cleanup() {
   local rc=$?
@@ -93,6 +94,10 @@ Uso directo:
   sudo ./install.sh --port <1-65535> --transport <plain|tls|auto> \\
     --max-download-frame <512-16384> --download-poll-timeout <duracion>
   sudo ./install.sh --uninstall
+
+AUTO-TUNE:
+  Ajusta automáticamente NOFILE, TasksMax y memoria por listener según vCPU, RAM
+  y cantidad de listeners HCR. Usa opción [14] después de redimensionar la VPS.
 
 Defaults SpeiGo:
   puerto: ${DEFAULT_PORT}
@@ -176,6 +181,142 @@ validate_frame() {
 validate_timeout() { [[ "$1" =~ ^[1-9][0-9]*(ms|s|m)$ ]]; }
 
 validate_transport() { case "$1" in plain|tls|auto) return 0 ;; *) return 1 ;; esac; }
+
+
+# -----------------------------------------------------------------------------
+# AUTO-TUNE v1.5.0
+# Ajusta límites por listener usando CPU, RAM y cantidad total de listeners HCR.
+# No toca sysctl globales ni parámetros de SSH para no perjudicar otros servicios.
+# -----------------------------------------------------------------------------
+AT_CPU=1
+AT_MEM_MB=1024
+AT_LISTENERS=1
+AT_CPU_SHARE=1
+AT_MEM_SHARE_MB=1024
+AT_NOFILE=16384
+AT_TASKS=512
+AT_MEMORY_HIGH_MB=512
+AT_MEMORY_MAX_MB=768
+AT_PROFILE="BALANCED"
+
+clamp_int() {
+  local v="$1" lo="$2" hi="$3"
+  [ "$v" -lt "$lo" ] && v="$lo"
+  [ "$v" -gt "$hi" ] && v="$hi"
+  printf '%s' "$v"
+}
+
+detect_cpu_count() {
+  local n=""
+  if command -v nproc >/dev/null 2>&1; then n="$(nproc 2>/dev/null || true)"; fi
+  if ! [[ "$n" =~ ^[1-9][0-9]*$ ]] && command -v getconf >/dev/null 2>&1; then
+    n="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+  fi
+  [[ "$n" =~ ^[1-9][0-9]*$ ]] || n=1
+  printf '%s' "$n"
+}
+
+detect_mem_mb() {
+  local kb=""
+  kb="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || true)"
+  [[ "$kb" =~ ^[1-9][0-9]*$ ]] || kb=1048576
+  printf '%s' "$((kb / 1024))"
+}
+
+extra_port_count() {
+  local p t f d n=0
+  if [ -f "$EXTRA_STATE_PATH" ]; then
+    while read -r p t f d; do
+      validate_port "${p:-}" || continue
+      validate_transport "${t:-}" || continue
+      validate_frame "${f:-}" || continue
+      validate_timeout "${d:-}" || continue
+      n=$((n + 1))
+    done < "$EXTRA_STATE_PATH"
+  fi
+  printf '%s' "$n"
+}
+
+managed_listener_count() {
+  local n=0 extras
+  extras="$(extra_port_count)"
+  if [ -L "$UNIT_LINK_PATH" ] || [ -f "$UNIT_SOURCE_PATH" ]; then n=1; fi
+  n=$((n + extras))
+  [ "$n" -ge 1 ] || n=1
+  printf '%s' "$n"
+}
+
+calculate_autotune() {
+  local listeners="${1:-1}" cpu mem cpu_share mem_share fd_cpu fd_mem nofile tasks
+  local reserve budget per_max per_high profile
+  [[ "$listeners" =~ ^[1-9][0-9]*$ ]] || listeners=1
+  cpu="$(detect_cpu_count)"
+  mem="$(detect_mem_mb)"
+  cpu_share=$(((cpu + listeners - 1) / listeners))
+  [ "$cpu_share" -ge 1 ] || cpu_share=1
+  mem_share=$((mem / listeners))
+  [ "$mem_share" -ge 128 ] || mem_share=128
+
+  fd_cpu=$((cpu_share * 16384))
+  fd_mem=$((mem_share * 16))
+  nofile="$fd_cpu"
+  [ "$fd_mem" -lt "$nofile" ] && nofile="$fd_mem"
+  nofile="$(clamp_int "$nofile" 8192 262144)"
+
+  tasks=$((cpu_share * 512))
+  tasks="$(clamp_int "$tasks" 512 8192)"
+
+  if [ "$mem" -le 2048 ]; then
+    reserve=$((mem / 4)); [ "$reserve" -ge 384 ] || reserve=384
+  elif [ "$mem" -le 4096 ]; then
+    reserve=768
+  else
+    reserve=$((mem / 5)); [ "$reserve" -ge 1024 ] || reserve=1024
+  fi
+  budget=$((mem - reserve)); [ "$budget" -ge 512 ] || budget=512
+  per_max=$((budget / listeners)); [ "$per_max" -ge 256 ] || per_max=256
+  per_high=$((per_max * 75 / 100)); [ "$per_high" -ge 192 ] || per_high=192
+
+  if [ "$cpu" -ge 8 ] && [ "$mem" -ge 8192 ]; then profile="HIGH-CAPACITY"
+  elif [ "$cpu" -ge 4 ] && [ "$mem" -ge 4096 ]; then profile="BALANCED+"
+  elif [ "$cpu" -ge 2 ] && [ "$mem" -ge 2048 ]; then profile="BALANCED"
+  else profile="SMALL-VPS"
+  fi
+
+  AT_CPU="$cpu"; AT_MEM_MB="$mem"; AT_LISTENERS="$listeners"
+  AT_CPU_SHARE="$cpu_share"; AT_MEM_SHARE_MB="$mem_share"
+  AT_NOFILE="$nofile"; AT_TASKS="$tasks"
+  AT_MEMORY_HIGH_MB="$per_high"; AT_MEMORY_MAX_MB="$per_max"
+  AT_PROFILE="$profile"
+}
+
+save_autotune_state() {
+  umask 077
+  cat > "$AUTOTUNE_STATE_PATH" <<EOF
+CPU=$AT_CPU
+MEM_MB=$AT_MEM_MB
+LISTENERS=$AT_LISTENERS
+CPU_SHARE=$AT_CPU_SHARE
+MEM_SHARE_MB=$AT_MEM_SHARE_MB
+LIMIT_NOFILE=$AT_NOFILE
+TASKS_MAX=$AT_TASKS
+MEMORY_HIGH_MB=$AT_MEMORY_HIGH_MB
+MEMORY_MAX_MB=$AT_MEMORY_MAX_MB
+PROFILE=$AT_PROFILE
+EOF
+  chmod 0600 "$AUTOTUNE_STATE_PATH"
+}
+
+show_autotune_summary() {
+  local count="${1:-$(managed_listener_count)}"
+  calculate_autotune "$count"
+  printf ' AUTO-TUNE: %b%s%b | CPU %b%s vCPU%b | RAM %b%s MB%b | Listeners %b%s%b\n' \
+    "$C_GREEN" "$AT_PROFILE" "$C_RESET" "$C_CYAN" "$AT_CPU" "$C_RESET" \
+    "$C_CYAN" "$AT_MEM_MB" "$C_RESET" "$C_CYAN" "$AT_LISTENERS" "$C_RESET"
+  printf ' Recursos/listener: NOFILE %b%s%b | Tasks %b%s%b | MemoryHigh %b%sM%b | MemoryMax %b%sM%b\n' \
+    "$C_CYAN" "$AT_NOFILE" "$C_RESET" "$C_CYAN" "$AT_TASKS" "$C_RESET" \
+    "$C_CYAN" "$AT_MEMORY_HIGH_MB" "$C_RESET" "$C_CYAN" "$AT_MEMORY_MAX_MB" "$C_RESET"
+}
 
 save_state() {
   umask 077
@@ -293,7 +434,8 @@ validate_extra_unit_link() {
 }
 
 render_extra_unit() {
-  local p="$1" t="$2" f="$3" d="$4" tls_args="" src
+  local p="$1" t="$2" f="$3" d="$4" listener_count="${5:-$(managed_listener_count)}" tls_args="" src
+  calculate_autotune "$listener_count"
   src="$(extra_unit_source_path "$p")"
   if [ "$t" = "tls" ] || [ "$t" = "auto" ]; then
     tls_args=" --tls-cert ${TLS_CERT_PATH} --tls-key ${TLS_KEY_PATH}"
@@ -307,7 +449,7 @@ Documentation=file:${SCRIPT_DIR}/README.md
 Wants=network-online.target
 After=network-online.target ssh.service sshd.service
 StartLimitIntervalSec=60
-StartLimitBurst=3
+StartLimitBurst=10
 
 [Service]
 Type=exec
@@ -315,8 +457,8 @@ User=root
 Group=root
 WorkingDirectory=${SCRIPT_DIR}
 ExecStart=${BINARY_PATH} --listen :${p} --target 127.0.0.1:22 --transport ${t}${tls_args} --max-download-frame ${f} --download-poll-timeout ${d}
-Restart=on-failure
-RestartSec=5s
+Restart=always
+RestartSec=2s
 TimeoutStopSec=15s
 KillSignal=SIGTERM
 UMask=0077
@@ -332,10 +474,11 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=true
 MemoryDenyWriteExecute=false
 ReadOnlyPaths=${SCRIPT_DIR}
-LimitNOFILE=4096
+LimitNOFILE=${AT_NOFILE}
 LimitCORE=0
-TasksMax=512
-MemoryMax=384M
+TasksMax=${AT_TASKS}
+MemoryHigh=${AT_MEMORY_HIGH_MB}M
+MemoryMax=${AT_MEMORY_MAX_MB}M
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=hcr-server-extra-${p}
@@ -408,8 +551,61 @@ cleanup_failed_extra_install() {
   systemctl reset-failed "${svc}.service" >/dev/null 2>&1 || true
 }
 
+retune_all_services() {
+  local count="${1:-$(managed_listener_count)}" p t f d
+  [[ "$count" =~ ^[1-9][0-9]*$ ]] || count=1
+  calculate_autotune "$count"
+
+  if [ -L "$UNIT_LINK_PATH" ] || [ -f "$UNIT_SOURCE_PATH" ]; then
+    load_state
+    render_unit "$count" || return 1
+    mv -f -- "$TEMP_UNIT" "$UNIT_SOURCE_PATH" || { fail "No se pudo actualizar AUTO-TUNE del HCR principal."; return 1; }
+    TEMP_UNIT=""
+  fi
+  if [ -f "$EXTRA_STATE_PATH" ]; then
+    while read -r p t f d; do
+      validate_port "${p:-}" || continue
+      validate_transport "${t:-}" || continue
+      validate_frame "${f:-}" || continue
+      validate_timeout "${d:-}" || continue
+      render_extra_unit "$p" "$t" "$f" "$d" "$count" || return 1
+    done < "$EXTRA_STATE_PATH"
+  fi
+
+  systemctl daemon-reload >/dev/null 2>&1 || { fail "systemd no pudo aplicar AUTO-TUNE."; return 1; }
+
+  if [ -L "$UNIT_LINK_PATH" ] || [ -f "$UNIT_SOURCE_PATH" ]; then
+    systemctl restart "${SERVICE_NAME}.service" || { fail "No se pudo reiniciar HCR principal tras AUTO-TUNE."; return 1; }
+    verify_service_health || return 1
+  fi
+  if [ -f "$EXTRA_STATE_PATH" ]; then
+    while read -r p t f d; do
+      validate_port "${p:-}" || continue
+      systemctl restart "$(extra_service_name "$p").service" || { fail "No se pudo reiniciar HCR extra TCP $p tras AUTO-TUNE."; return 1; }
+      verify_extra_health "$p" || return 1
+    done < "$EXTRA_STATE_PATH"
+  fi
+
+  calculate_autotune "$count"
+  save_autotune_state
+  return 0
+}
+
+manual_autotune() {
+  service_is_installed || { fail "HCR principal aún no está instalado."; return 1; }
+  local count
+  count="$(managed_listener_count)"
+  printf 'Recalculando AUTO-TUNE con CPU/RAM actuales y %s listener(s)...\n' "$count"
+  if ! retune_all_services "$count"; then
+    printf '%b[ERROR]%b AUTO-TUNE no pudo aplicarse completamente. Revisa Estado/Logs.\n' "$C_RED" "$C_RESET"
+    return 1
+  fi
+  printf '%b[OK]%b AUTO-TUNE aplicado y listeners validados.\n' "$C_GREEN" "$C_RESET"
+  show_autotune_summary "$count"
+}
+
 install_extra_service() {
-  local p="$1" t="$2" f="$3" d="$4" svc src link
+  local p="$1" t="$2" f="$3" d="$4" planned_count="${5:-$(( $(managed_listener_count) + 1 ))}" svc src link
   validate_port "$p" || { fail "Puerto extra inválido: $p"; return 1; }
   validate_transport "$t" || { fail "Transport extra inválido: $t"; return 1; }
   validate_frame "$f" || { fail "Frame extra inválido: $f"; return 1; }
@@ -425,7 +621,7 @@ install_extra_service() {
   src="$(extra_unit_source_path "$p")"
   link="$(extra_unit_link_path "$p")"
 
-  render_extra_unit "$p" "$t" "$f" "$d" || return 1
+  render_extra_unit "$p" "$t" "$f" "$d" "$planned_count" || return 1
   if [ ! -L "$link" ]; then
     ln -s -- "$src" "$link" || { fail "No se pudo enlazar la unidad extra TCP $p."; cleanup_failed_extra_install "$p"; return 1; }
   fi
@@ -488,7 +684,7 @@ show_extra_ports() {
 add_extra_port_menu() {
   service_is_installed || { fail "Instala primero el HCR principal con la opción 1 o 2."; return 1; }
   load_state
-  local main_port="$PORT" p="" inherit="" et="$TRANSPORT" ef="$MAX_DOWNLOAD_FRAME" ed="$DOWNLOAD_POLL_TIMEOUT" value=""
+  local main_port="$PORT" p="" inherit="" et="$TRANSPORT" ef="$MAX_DOWNLOAD_FRAME" ed="$DOWNLOAD_POLL_TIMEOUT" value="" old_count planned_count
   prompt_read p "Nuevo puerto HCR adicional: " || return 1
   validate_port "$p" || { fail "Puerto inválido."; return 1; }
   p="$((10#$p))"
@@ -519,15 +715,26 @@ add_extra_port_menu() {
     *) : ;;
   esac
 
-  if ! install_extra_service "$p" "$et" "$ef" "$ed"; then
+  old_count="$(managed_listener_count)"
+  planned_count=$((old_count + 1))
+  if ! install_extra_service "$p" "$et" "$ef" "$ed" "$planned_count"; then
     load_state
     printf '%b[NO CREADO]%b TCP %s no se registró como listener HCR adicional.\n' "$C_RED" "$C_RESET" "$p"
     return 1
   fi
 
+  printf '%b[AUTO-TUNE]%b Repartiendo recursos entre %s listeners HCR...\n' "$C_GOLD" "$C_RESET" "$planned_count"
+  if ! retune_all_services "$planned_count"; then
+    printf '%b[ROLLBACK]%b El nuevo puerto inició, pero AUTO-TUNE no validó el conjunto. Se elimina TCP %s.\n' "$C_RED" "$C_RESET" "$p"
+    remove_extra_service "$p" false || true
+    retune_all_services "$old_count" || true
+    load_state
+    return 1
+  fi
+
   firewall_open "$p" || true
   load_state
-  printf '%b[OK]%b Listener HCR adicional TCP %s creado, estable y escuchando.\n' "$C_GREEN" "$C_RESET" "$p"
+  printf '%b[OK]%b Listener HCR adicional TCP %s creado, estable, escuchando y AUTO-TUNED.\n' "$C_GREEN" "$C_RESET" "$p"
 }
 
 remove_extra_port_menu() {
@@ -539,6 +746,12 @@ remove_extra_port_menu() {
   p="$((10#$p))"
   extra_port_exists "$p" || { fail "TCP $p no es un puerto HCR adicional administrado por este manager."; return 1; }
   remove_extra_service "$p" true
+  local new_count
+  new_count="$(managed_listener_count)"
+  printf '%b[AUTO-TUNE]%b Recalculando recursos para %s listener(s)...\n' "$C_GOLD" "$C_RESET" "$new_count"
+  if ! retune_all_services "$new_count"; then
+    printf '%b[AVISO]%b El puerto fue eliminado, pero AUTO-TUNE no pudo revalidar todos los listeners. Usa la opción 14.\n' "$C_GOLD" "$C_RESET"
+  fi
   printf '%b[OK]%b Listener HCR adicional TCP %s eliminado. El principal sigue intacto.\n' "$C_GREEN" "$C_RESET" "$p"
 }
 
@@ -559,7 +772,8 @@ validate_unit_link() {
 }
 
 render_unit() {
-  local tls_args=""
+  local listener_count="${1:-$(managed_listener_count)}" tls_args=""
+  calculate_autotune "$listener_count"
   if [ "$TRANSPORT" = "tls" ] || [ "$TRANSPORT" = "auto" ]; then
     tls_args=" --tls-cert ${TLS_CERT_PATH} --tls-key ${TLS_KEY_PATH}"
   fi
@@ -572,7 +786,7 @@ Documentation=file:${SCRIPT_DIR}/README.md
 Wants=network-online.target
 After=network-online.target ssh.service sshd.service
 StartLimitIntervalSec=60
-StartLimitBurst=3
+StartLimitBurst=10
 
 [Service]
 Type=exec
@@ -580,8 +794,8 @@ User=root
 Group=root
 WorkingDirectory=${SCRIPT_DIR}
 ExecStart=${BINARY_PATH} --listen :${PORT} --target 127.0.0.1:22 --transport ${TRANSPORT}${tls_args} --max-download-frame ${MAX_DOWNLOAD_FRAME} --download-poll-timeout ${DOWNLOAD_POLL_TIMEOUT}
-Restart=on-failure
-RestartSec=5s
+Restart=always
+RestartSec=2s
 TimeoutStopSec=15s
 KillSignal=SIGTERM
 UMask=0077
@@ -597,10 +811,11 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=true
 MemoryDenyWriteExecute=false
 ReadOnlyPaths=${SCRIPT_DIR}
-LimitNOFILE=4096
+LimitNOFILE=${AT_NOFILE}
 LimitCORE=0
-TasksMax=512
-MemoryMax=384M
+TasksMax=${AT_TASKS}
+MemoryHigh=${AT_MEMORY_HIGH_MB}M
+MemoryMax=${AT_MEMORY_MAX_MB}M
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=hcr-server
@@ -646,7 +861,9 @@ install_service() {
   fi
   validate_bundle || return 1
   validate_unit_link || return 1
-  render_unit || return 1
+  local planned_count
+  planned_count=$((1 + $(extra_port_count)))
+  render_unit "$planned_count" || return 1
   mv -f -- "$TEMP_UNIT" "$UNIT_SOURCE_PATH" || { fail "No se pudo instalar la unidad principal."; return 1; }
   TEMP_UNIT=""
   if [ ! -L "$UNIT_LINK_PATH" ]; then
@@ -662,6 +879,12 @@ install_service() {
   fi
   verify_service_health || return 1
   save_state || { fail "HCR inició, pero no se pudo guardar el estado del manager."; return 1; }
+  calculate_autotune "$planned_count"
+  save_autotune_state
+  if [ "$(extra_port_count)" -gt 0 ]; then
+    printf '%b[AUTO-TUNE]%b Rebalanceando HCR principal + extras...\n' "$C_GOLD" "$C_RESET"
+    retune_all_services "$planned_count" || return 1
+  fi
   return 0
 }
 
@@ -741,7 +964,7 @@ uninstall_service() {
     systemctl daemon-reload
     systemctl reset-failed "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
   fi
-  rm -f -- "$STATE_PATH" "$EXTRA_STATE_PATH"
+  rm -f -- "$STATE_PATH" "$EXTRA_STATE_PATH" "$AUTOTUNE_STATE_PATH"
   printf '%b[OK]%b HCR principal y todos los listeners HCR adicionales fueron desinstalados. El binario oficial y el manager se conservaron.\n' "$C_GREEN" "$C_RESET"
   if [ -f "$FIREWALL_STATE_PATH" ] && grep -qx "$old_port" "$FIREWALL_STATE_PATH" 2>/dev/null; then
     firewall_close "$old_port" || true
@@ -757,6 +980,7 @@ status_line() {
   printf ' Principal: %b%s%b | Puerto: %b%s%b | Transport: %b%s%b\n' "$svc_color" "$svc" "$C_RESET" "$C_CYAN" "$PORT" "$C_RESET" "$C_CYAN" "$TRANSPORT" "$C_RESET"
   printf ' Rendimiento principal: Frame %b%s%b | Poll %b%s%b\n' "$C_CYAN" "$MAX_DOWNLOAD_FRAME" "$C_RESET" "$C_CYAN" "$DOWNLOAD_POLL_TIMEOUT" "$C_RESET"
   show_extra_ports
+  show_autotune_summary "$(managed_listener_count)"
   printf '%b%s%b\n' "$C_GOLD" "$BAR" "$C_RESET"
 }
 
@@ -766,7 +990,7 @@ show_menu() {
   load_state
   printf '%b%s%b\n' "$C_GOLD" "$BAR" "$C_RESET"
   printf '%b      HCR / SPEIGO VPN  -  MENÚ DE INSTALACIONES%b\n' "$C_WHITE" "$C_RESET"
-  printf '%b              Manager PRO v%s MULTI-PORT%b\n' "$C_GRAY" "$MANAGER_VERSION" "$C_RESET"
+  printf '%b              Manager PRO v%s AUTO-TUNE MULTI-PORT%b\n' "$C_GRAY" "$MANAGER_VERSION" "$C_RESET"
   printf '%b%s%b\n' "$C_GOLD" "$BAR" "$C_RESET"
   printf '  %b[1]%b Instalación rápida HCR Plain :%s  %b[16384 / 8s]%b\n' "$C_CYAN" "$C_RESET" "$DEFAULT_PORT" "$C_GREEN" "$C_RESET"
   printf '  %b[2]%b Instalación personalizada principal (Plain/TLS/Auto)\n' "$C_CYAN" "$C_RESET"
@@ -781,6 +1005,7 @@ show_menu() {
   printf ' %b[11]%b Reiniciar HCR principal + extras\n' "$C_CYAN" "$C_RESET"
   printf ' %b[12]%b Ver registros HCR\n' "$C_CYAN" "$C_RESET"
   printf ' %b[13]%b Desinstalar HCR completo\n' "$C_CYAN" "$C_RESET"
+  printf ' %b[14]%b Recalcular AUTO-TUNE CPU/RAM\n' "$C_CYAN" "$C_RESET"
   printf '  %b[0]%b Salir\n' "$C_CYAN" "$C_RESET"
   status_line
 }
@@ -793,7 +1018,8 @@ install_quick() {
     return 1
   fi
   firewall_open "$PORT" || true
-  printf '%b[OK]%b HCR instalado y activo.\n' "$C_GREEN" "$C_RESET"
+  printf '%b[OK]%b HCR instalado, activo y AUTO-TUNED.\n' "$C_GREEN" "$C_RESET"
+  show_autotune_summary "$(managed_listener_count)"
 }
 
 choose_transport() {
@@ -992,6 +1218,7 @@ menu_loop() {
       11) restart_hcr || true ;;
       12) show_logs || true ;;
       13) confirm_uninstall || true ;;
+      14) manual_autotune || true ;;
       0) clear_screen; echo "Saliendo de HCR / SPEIGO VPN Manager."; return 0 ;;
       *) printf '%bOpción inválida.%b\n' "$C_RED" "$C_RESET" ;;
     esac
@@ -1032,6 +1259,7 @@ main() {
       validate_timeout "$DOWNLOAD_POLL_TIMEOUT" || fail "DOWNLOAD_POLL_TIMEOUT inválido."
       install_service
       printf '%b[OK]%b HCR instalado: TCP %s | %s | Frame %s | Poll %s\n' "$C_GREEN" "$C_RESET" "$PORT" "$TRANSPORT" "$MAX_DOWNLOAD_FRAME" "$DOWNLOAD_POLL_TIMEOUT"
+      show_autotune_summary "$(managed_listener_count)"
       ;;
   esac
 }
