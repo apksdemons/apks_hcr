@@ -1,6 +1,6 @@
-# HCR / SpeiGo VPN Manager PRO v1.3.0 (amd64)
+# HCR / SpeiGo VPN Manager PRO v1.4.0 MULTI-PORT (amd64)
 
-Manager interactivo profesional para el binario oficial **hcr-server 0.0.3 - Patch 1**.
+Manager profesional para el binario oficial **hcr-server 0.0.3 - Patch 1**.
 
 ## Abrir el menú
 
@@ -8,7 +8,7 @@ Manager interactivo profesional para el binario oficial **hcr-server 0.0.3 - Pat
 sudo ./install.sh
 ```
 
-También acepta:
+o:
 
 ```bash
 sudo ./install.sh menu
@@ -17,14 +17,65 @@ sudo ./install.sh menu
 ## Perfil rápido recomendado para SpeiGo
 
 - Transport: `plain`
-- Puerto sugerido: `8880` (editable; no es obligatorio)
+- Puerto principal sugerido: `8880` (editable)
 - `MAX_DOWNLOAD_FRAME=16384`
 - `DOWNLOAD_POLL_TIMEOUT=8s`
 - SSH target: `127.0.0.1:22`
 
-El menú permite instalación rápida, instalación personalizada, cambio de puerto, cambio de transport, firewall, estado, reinicio, logs y desinstalación. La instalación personalizada incluye los ajustes Frame/Poll.
+## MULTI-PORT REAL
 
-## Uso directo sin menú
+Después de instalar el HCR principal con la opción **[1]** o **[2]**, usa:
+
+- **[5] Agregar puerto HCR adicional [LISTENER REAL]**
+- **[6] Eliminar puerto HCR adicional**
+- **[7] Ver puertos HCR activos**
+
+Ejemplo:
+
+- Principal: TCP `8880`
+- Extra: TCP `8080`
+- Extra: TCP `9000`
+
+Cada puerto adicional crea su propio servicio systemd:
+
+```text
+hcr-server.service
+hcr-server-extra-8080.service
+hcr-server-extra-9000.service
+```
+
+Todos ejecutan el mismo `hcr-server` oficial, pero cada uno escucha realmente en su puerto. No se trata únicamente de abrir reglas de firewall.
+
+Por defecto un puerto adicional hereda del principal `transport`, `MAX_DOWNLOAD_FRAME` y `DOWNLOAD_POLL_TIMEOUT`. El manager permite personalizar estos parámetros si se desea.
+
+El firewall UFW/firewalld se abre automáticamente al crear cada listener adicional cuando está activo.
+
+## Menú principal
+
+```text
+[1]  Instalación rápida HCR Plain :8880 [16384 / 8s]
+[2]  Instalación personalizada principal
+[3]  Cambiar puerto HCR principal
+[4]  Cambiar transport HCR principal
+[5]  Agregar puerto HCR adicional [LISTENER REAL]
+[6]  Eliminar puerto HCR adicional
+[7]  Ver puertos HCR activos
+[8]  Abrir puerto TCP solo en firewall
+[9]  Cerrar puerto TCP solo en firewall
+[10] Estado completo HCR
+[11] Reiniciar HCR principal + extras
+[12] Ver registros HCR
+[13] Desinstalar HCR completo
+[0]  Salir
+```
+
+## Diferencia importante
+
+**Agregar puerto HCR adicional** crea un listener HCR real y funcional.
+
+**Abrir puerto TCP solo en firewall** únicamente modifica UFW/firewalld y no inicia un listener HCR.
+
+## Uso directo del puerto principal sin menú
 
 ```bash
 sudo ./install.sh --port 9000 --transport plain --max-download-frame 16384 --download-poll-timeout 8s
@@ -37,19 +88,12 @@ Para `tls` o `auto`, coloca junto a `install.sh`:
 - `fullchain.pem`
 - `privkey.pem`
 
-La clave privada debe ser accesible solo por root (por ejemplo `chmod 600 privkey.pem`).
+## Launcher de un solo comando
 
-## Firewall
+Si el repositorio contiene `start.sh`, el menú puede abrirse con:
 
-Las opciones Abrir/Cerrar puerto soportan UFW y firewalld cuando están activos. Si la VPS usa firewall externo del proveedor, el manager informa que debes abrir el puerto también en ese panel.
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/apksdemons/apks_hcr/refs/heads/main/start.sh)
+```
 
-## Rendimiento
-
-Presets del menú:
-
-- 16384: máximo rendimiento / recomendado
-- 12288: balanceado
-- 8192: conservador
-- 6144: perfil anterior / rollback
-
-Para SpeiGo CODE148 actual se recomienda conservar `DOWNLOAD_POLL_TIMEOUT=8s`.
+El launcher actualiza `install.sh`, `hcr-server` y `README.md` en `/opt/speigo-hcr` y abre el menú.
